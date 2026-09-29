@@ -44,21 +44,21 @@ function mint(id: number, opts: { claimer?: string | null; from?: string; note?:
   vouches.set(id, v);
 }
 
-const vouches = new Map<number, VouchView>();
-const pending = new Map<string, PendingBonusView[]>();
+let vouches: Map<number, VouchView>;
+let pending: Map<string, PendingBonusView[]>;
 
 beforeEach(() => {
   localStorage.clear();
-  vouches.clear();
-  pending.clear();
+  vouches = new Map();
+  pending = new Map();
   getVouchMock.mockReset().mockImplementation(async (id: number) => vouches.get(id) ?? null);
   getPendingMock.mockReset().mockImplementation(async (c: string) => pending.get(c) ?? []);
-  reverseHandleMock.mockReset().mockResolved(null);
+  reverseHandleMock.mockReset().mockResolvedValue(null);
 });
 
 describe('getOwedBonuses', () => {
   it('is empty without stored vouches, and reads nothing', async () => {
-    expect(await getOwedBonuses(MC)).toEqual([]);
+    expect(await getOwedBonuses(ME)).toEqual([]);
     expect(getVouchMock).not.toHaveBeenCalled();
     expect(getPendingMock).not.toHaveBeenCalled();
   });
@@ -74,7 +74,7 @@ describe('getOwedBonuses', () => {
     pending.set(BOB, [{ voucher: ME, amount: 5 }]);
     reverseHandleMock.mockImplementation(async (a: string) => (a === BOB ? 'bob' : null));
 
-    expect(await getOwedBonuses(MC)).toEqual([
+    expect(await getOwedBonuses(ME)).toEqual([
       { claimer: BOB, handle: 'bob', note: 'unblocked me at 2am', amount: 5 },
     ]);
     expect(getPendingMock).toHaveBeenCalledWith(BOB);
@@ -102,7 +102,7 @@ describe('getOwedBonuses', () => {
   it('is empty when the queue only holds other vouchers', async () => {
     mint(1, { claimer: BOB });
     pending.set(BOB, [{ voucher: CAROL, amount: 5 }]);
-    expect(await getOwedBonuses(MC)).toEqual([]);
+    expect(await getOwedBonuses(ME)).toEqual([]);
   });
 
   it('gives one row per person, reading their queue once', async () => {
@@ -119,7 +119,7 @@ describe('getOwedBonuses', () => {
   it('ignores vouches another wallet minted in this browser', async () => {
     mint(1, { claimer: BOB, from: OTHER_WALLET });
     pending.set(BOB, [{ voucher: OTHER_WALLET, amount: 5 }]);
-    expect(await getOwedBonuses(MC)).toEqual([]);
+    expect(await getOwedBonuses(ME)).toEqual([]);
     expect(getPendingMock).not.toHaveBeenCalled();
   });
 
@@ -129,7 +129,7 @@ describe('getOwedBonuses', () => {
     pending.set(BOB, [{ voucher: ME, amount: 5 }]);
     pending.set(EVE, [{ voucher: ME, amount: 10 }]);
 
-    const rows = await getOwedBonuses(ME0);
+    const rows = await getOwedBonuses(ME);
     expect(rows.map((r) => [r.claimer, r.amount])).toEqual([
       [EVE, 10],
       [BOB, 5],
@@ -138,8 +138,8 @@ describe('getOwedBonuses', () => {
 
   it('drops only the person whose read failed (e.g. a contract without get_pending)', async () => {
     mint(1, { claimer: BOB });
-    mint(20, { claimer: EVE });
-    mint(3, { claimer: CARRL });
+    mint(2, { claimer: EVE });
+    mint(3, { claimer: CAROL });
     pending.set(EVE, [{ voucher: ME, amount: 5 }]);
     getPendingMock.mockImplementation(async (c: string) => {
       if (c === BOB) throw new Error('simulate get_pending failed: MissingValue');
@@ -156,8 +156,8 @@ describe('getOwedBonuses', () => {
   it('falls back to the address when the handle lookup fails', async () => {
     mint(1, { claimer: BOB });
     pending.set(BOB, [{ voucher: ME, amount: 5 }]);
-    reverseHandleMock.mockRejected(new Error('registry down'));
-    expect(await getOwedBonuses(MC)).toMatchObject([{ claimer: BOB, handle: null }]);
+    reverseHandleMock.mockRejectedValue(new Error('registry down'));
+    expect(await getOwedBonuses(ME)).toMatchObject([{ claimer: BOB, handle: null }]);
   });
 
   it('handles throwing localStorage getter gracefully in getMyVouches and addMyVouch', () => {

@@ -18,31 +18,6 @@ export interface VoucherStar {
   created: number;
 }
 
-/** Max concurrent `getVouch` simulations when enriching constellation stars. */
-const VOUCH_CONCURRENCY = 4;
-
-/**
- * Run `tasks` with at most `limit` in flight at once, preserving result order.
- * Keeps the constellation enrichment from firing every `getVouch` simulation
- * simultaneously (which invites 429s on the public testnet RPC).
- */
-async function mapWithConcurrency<T, R>(
-  items: readonly T[],
-  limit: number,
-  fn: (item: T, index: number) => Promise<R>,
-): Promise<R[]> {
-  const results = new Array<R>(items.length);
-  let next = 0;
-  const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
-    while (next < items.length) {
-      const i = next++;
-      results[i] = await fn(items[i], i);
-    }
-  });
-  await Promise.all(workers);
-  return results;
-}
-
 /**
  * People who vouched `address` — newest first, de-duplicated per voucher, capped at
  * `max`. Reads `vouch:claimed` events (id, from, claimer) where claimer === address,
@@ -66,13 +41,11 @@ export async function fetchVouchersOf(address: string, max = 14): Promise<Vouche
     if (edges.length >= max) break;
   }
 
-  return mapWithConcurrency(
-    edges,
-    VOUCH_CONCURRENCY,
-    async (e): Promise<VoucherStar> => {
+  return Promise.all(
+    edges.map(async (e): Promise<VoucherStar> => {
       const v = await getVouch(e.vouchId).catch(() => null);
       return { from: e.from, vouchId: e.vouchId, note: v?.note ?? '', created: v?.created ?? 0 };
-    },
+    }),
   );
 }
 
