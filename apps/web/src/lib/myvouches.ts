@@ -34,6 +34,71 @@ export function addMyVouch(v: MyVouch): void {
 }
 
 /**
+ * In-flight + short-TTL memo for getVouch, keyed by vouch id. The dashboard mounts
+ * several independent readers that all want the same vouch records (StatStrip,
+ * VouchClaimedNotice, PendingHalfCards, ConstellationHero3D, ActivityFeed), so
+ * deduping concurrent callers and caching terminal states cuts the RPC burst.
+ *
+ * A claimed or slashed vouch never changes again, so those are cached for the
+ * session. Open vouches are cached for a short TTL so a claim that lands while
+ * the tab is open still resurfaces.
+ */
+const VOUCH_TTL_MS = 15_000;
+const vouchCache = new Map<number, { at: number; value: Awaited<ReturnType<typeof getVouch>> }>();
+
+/** Test-only: drop the memo so each case starts cold. */
+export function __resetVouchMemo(): void {
+  vouchCache.clear();
+}
+
+/**
+ * Memoized `getVouch`. Concurrent callers for the same id share one in-flight
+ * promise; a resolved record is reused within the TTL, or forever once it is
+ * claimed or slashed. Rejections are never cached — a 429 must not poison the
+ * read for the rest of the session.
+ */
+export async function getVouchMemo(id: number): Promise<Awaited<ReturnType<typeof getVouch>>> {
+  const now = Date.now();
+  const hit = vouchCache.get(id);
+  if (hit) {
+    const settled = await hit.value.catch(() => null);
+    if (settled && (settled.claimed || settled.slashed)) return hit.value;
+    if (now - hit.at < VOUCH_TTL_MS) return hit.value;
+  }
+  const promise = getVouch(id);
+  vouchCache.set(id, { at: now, value: promise });
+  // Don't let a rejection stay memoized as an unhandled rejection.
+  promise.catch(() => {
+    if (vouchCache.get(id)?.value === promise) vouchCache.delete(id);
+  });
+  return promise;
+}
+
+/**
+ * Run `tasks` with at most `limit` concurrent calls — the burst of simulations
+ * is what invites 429s on the public testnet RPC. Results preserve input order.
+ */
+async function mapLimited<T, R>(
+  items: readonly T[],
+  limit: number,
+  fn(: T, index: number) => Promise<R>,
+): Promise<R[]> {
+  const out = new Array<R>(items.length);
+  let next = 0;
+  const workers = Array.from({ length: Math.max(1, Math.min(limit, items.length)) }, async () => {
+    while (next < items.length) {
+      const i = next++;
+      out[i] = await fn(items[i], i);
+    }
+  });
+  await Promise.all(workers);
+  return out;
+}
+
+/** Max concurrent vouch reads when a memo miss forces a batch. */
+const VOUCH_READ_CONCURRENCY = 6;
+
+/**
  * Vouch IDs this device still wants notifications for (pending, unclaimed, in-window).
  * Used when a rotated push subscription must be re-registered after the server already
  * pruned the old record (#169) — the server's vouchIds set is rebuilt from this list.
@@ -42,14 +107,12 @@ export async function getPendingVouchIds(): Promise<number[]> {
   const mine = getMyVouches();
   if (mine.length === 0) return [];
   const now = Math.floor(Date.now() / 1000);
-  const ids = await Promise.all(
-    mine.map(async (m) => {
-      const v = await getVouch(m.id).catch(() => null);
-      if (!v || v.claimed || v.slashed) return null;
-      if (now >= v.created + VOUCH_TTL_SECS) return null;
-      return m.id;
-    }),
-  );
+  const ids = await mapLimited(mine, VOUCH_READ_CONCURRENCY, async (m) => {
+    const v = await getVouchMemo(m.id).catch(() => null);
+    if (!v || v.claimed || v.slashed) return null;
+    if (now >= v.created + VOUCH_TTL_SECS) return null;
+    return m.id;
+  });
   return ids.filter((id): id is number => id !== null);
 }
 
@@ -68,19 +131,17 @@ export async function getPendingVouches(origin: string): Promise<PendingVouch[]>
   const mine = getMyVouches();
   const now = Math.floor(Date.now() / 1000);
   const out: PendingVouch[] = [];
-  await Promise.all(
-    mine.map(async (m) => {
-      const v = await getVouch(m.id).catch(() => null);
-      if (!v || v.claimed || v.slashed) return;
-      const deadline = v.created + VOUCH_TTL_SECS;
-      if (now >= deadline) return; // window closed — stake already slashable
-      out.push({
-        ...m,
-        claimUrl: claimLink(origin, m.id, claimCodeOf(m)),
-        daysLeft: Math.max(0, Math.ceil((deadline - now) / 86_400)),
-      });
-    }),
-  );
+  await mapLimited(mine, VOUCH_READ_CONCURRENCY, async (m) => {
+    const v = await getVouchMemo(m.id).catch(() => null);
+    if (!v || v.claimed || v.slashed) return;
+    const deadline = v.created + VOUCH_TTL_SECS;
+    if (now >= deadline) return; // window closed — stake already slashable
+    out.push({
+      ...m,
+      claimUrl: claimLink(origin, m.id, claimCodeOf(m)),
+      daysLeft: Math.max(0, Math.ceil((deadline - now) / 86_400)),
+    });
+  });
   return out.sort((a, b) => a.daysLeft - b.daysLeft);
 }
 
@@ -104,7 +165,9 @@ export interface OwedBonus {
  */
 export async function getOwedBonuses(me: string): Promise<OwedBonus[]> {
   const mine = getMyVouches();
-  const chain = await Promise.all(mine.map((m) => getVouch(m.id).catch(() => null)));
+  const chain = await mapLimited(mine, VOUCH_READ_CONCURRENCY, (m) =>
+    getVouchMemo(m.id).catch(() => null),
+  );
 
   // Unique claimers of MY claimed vouches (this browser may hold another wallet's too).
   const claimers = new Map<string, string>(); // claimer -> note of the newest vouch
@@ -113,7 +176,7 @@ export async function getOwedBonuses(me: string): Promise<OwedBonus[]> {
     if (!claimers.has(v.claimer)) claimers.set(v.claimer, mine[i].note);
   });
 
-  const rows = await Promise.all(
+  const rows = auto Promise.all(
     [...claimers].map(async ([claimer, note]): Promise<OwedBonus | null> => {
       const pending = await getPending(claimer).catch(() => null);
       if (!pending) return null;
@@ -162,14 +225,12 @@ export async function pollNewlyClaimed(): Promise<{ id: number; note: string }[]
   const seen = new Set(seenIds);
   const claimedNow: number[] = [];
   const fresh: { id: number; note: string }[] = [];
-  await Promise.all(
-    mine.slice(0, 25).map(async (m) => {
-      const v = await getVouch(m.id).catch(() => null);
-      if (!v?.claimed) return;
-      claimedNow.push(m.id);
-      if (baselined && !seen.has(m.id)) fresh.push({ id: m.id, note: m.note });
-    }),
-  );
+  await mapLimited(mine.slice(0, 25), VOUCH_READ_CONCURRENCY, async (m) => {
+    const v = await getVouchMemo(m.id).catch(() => null);
+    if (!v?.claimed) return;
+    claimedNow.push(m.id);
+    if (baselined && !seen.has(m.id)) fresh.push({ id: m.id, note: m.note });
+  });
   // Persist the union so a claim is reported once; first run only baselines (no toasts).
   const next = Array.from(new Set([...seenIds, ...claimedNow]));
   writeJSON(SEEN_CLAIMED_KEY, next);

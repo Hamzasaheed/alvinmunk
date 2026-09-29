@@ -11,7 +11,7 @@ import { shareInFlight } from './utils';
 
 /**
  * RPC event retention is ~24h; staying within ~9000 ledgers keeps `getEvents` returning
- * rows instead of an out-of-range error (≥16k returns 0 events). It must also stay under
+ * rows instead of an out-of-range error (>16k returns 0 events). It must also stay under
  * the 10,000 ledgers stellar-rpc scans per request: only then does a short page mean the
  * scan reached the latest ledger (see `scanContractEvents`).
  */
@@ -27,6 +27,13 @@ export const PAGE_SIZE = 1000;
  * (#109) has to replace RPC-direct reads.
  */
 export const MAX_PAGES = 10;
+
+/**
+ * How long a settled `fetchReputationEvents` result is reused before the next RPC scan.
+ * The dashboard mounts feed + constellation + badges together, so a short TTL keeps the
+ * cold /app load to one getEvents window without making the feed stale for long.
+ */
+export const REPuTATION_TTL_MS = 15_000;
 
 /** A decoded contract event: topics + value already run through scValToNative. */
 export interface RepEvent {
@@ -54,11 +61,31 @@ export function decodeScVal(v: xdr.ScVal | string): unknown {
  * the last element is the newest — the scan follows the RPC cursor across pages up to
  * MAX_PAGES. Returns [] if the contract isn't deployed or RPC is unavailable so every
  * caller degrades gracefully. Concurrent callers (feed, constellation, badges mounting
- * together) share one scan.
+ * together) share one scan, and a settled result is reused for REPUTATION_TTL_MS.
  */
 export async function fetchReputationEvents(options?: { throwOnError?: boolean }): Promise<RepEvent[]> {
-  return fetchContractEvents(config.contracts.reputation, ['*', '*'], PAGE_SIZE * MAX_PAGES, options?.throwOnError);
+  const key = `${config.contracts.reputation}|${PAGE_SIZE * MAX_PAGES}|${options?.throwOnError ? '1' : '0'}`;
+  const now = Date.now();
+  const cached = reputationCache.get(key);
+  if (cached && cached.expires > now) {
+    return cached.promise;
+  }
+  const promise = fetchContractEvents(
+    config.contracts.reputation,
+    ['*', '*'],
+    PAGE_SIZE * MAX_PAGES,
+    options?.throwOnError,
+  );
+  reputationCache.set(key, { promise, expires: now + REPUTATION_TTL_MS });
+  // Drop the cache entry on rejection so a failed scan doesn't poison the TTL.
+  promise.catch(() => {
+    if (reputationCache.get(key)?.promise === promise) reputationCache.delete(key);
+  });
+  return promise;
 }
+
+/** In-flight + short-TTL memo for the reputation event window. */
+const reputationCache = new Map<string, { promise: Promise<RepEvent[]>; expires: number }>();
 
 /**
  * Every `tipped` event in the window (topics ('tipped', from, to) · data amount), decoded,
@@ -73,8 +100,8 @@ export async function fetchTipEvents(options?: { throwOnError?: boolean }): Prom
 }
 
 /**
- * `tipped` events SENT by `from` (topics ('tipped', from, to) · data amount), oldest-first.
- * RPC topic filters only match events with exactly as many topics as segments, so the
+ * `tipped` events SENT by `from` (topics ('tipped', from, to) ·data amount), oldest-first.
+ * RPC topic filters only match events with exactly as many segments as segments, so the
  * 2-segment wildcard above never sees these 3-topic events; filtering on the sender here
  * also keeps the read to one wallet's tips instead of the whole rewards contract.
  *

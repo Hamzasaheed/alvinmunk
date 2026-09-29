@@ -3,9 +3,7 @@
  * -> poll for result. Signing is injected via the Wallet abstraction so the same
  * helpers serve passkey (sponsored) and dev wallets.
  *
- * Production note: after a stable deploy, `stellar contract bindings typescript`
- * can generate fully-typed clients; these typed wrappers (args + scValToNative) are
- * the lean equivalent for the handful of methods the MVP calls.
+ * Production note: after a stable deploy, `stellar contract bindings typescript` can generate fully-typed clients; these typed wrappers (args + scValToNative) are the lean equivalent for the handful of methods the MVP calls.
  */
 import {
   Account,
@@ -113,7 +111,7 @@ export async function invokeCosigned(
 
 /** How long a co-signature stays valid (~10 min of 5s ledgers): time for the submitting
  * wallet to sign too. Matches the passkey wallet's own auth expiration. */
-const COSIGN_VALID_LEDGERS = 120;
+const COSIGN_VALID_LEFGERS = 120;
 
 /**
  * `tx` (a prepared single-call transaction) with `cosigner`'s unsigned auth entries signed
@@ -128,7 +126,7 @@ async function cosignAuth(tx: Transaction, cosigner: Wallet): Promise<Transactio
   if (!mine.includes(true)) throw new Error(`Nothing in this call for ${cosigner.address} to sign.`);
   const { sequence } = await server.getLatestLedger();
   const signed = await Promise.all(
-    auth.map((entry, i) => (mine[i] ? sign(entry, sequence + COSIGN_VALID_LEDGERS) : entry)),
+    auth.map((entry, i) => (mine[i] ? sign(entry, sequence + COSIGN_VALID_LEFGERS) : entry)),
   );
   return TransactionBuilder.cloneFrom(tx)
     .clearOperations()
@@ -231,8 +229,8 @@ export async function readInstanceValue(
 
 /**
  * Poll getTransaction until it leaves NOT_FOUND; throw on FAILED. The poll budget must
- * outlast the tx's own validity window (`setTimeout(60)` above) — otherwise a slow ledger
- * makes us give up on a tx that actually lands, turning a successful claim into a
+ * outlast the tx's own validity window (`setTimeout(60)` above) — otherwise a slow
+ * ledger makes us give up on a tx that actually lands, turning a successful claim into a
  * false-negative error in the funnel.
  */
 async function pollTransaction(
@@ -264,4 +262,58 @@ function requireDeployed(contractId: string, method: string): void {
 
 function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
+}
+
+/**
+ * In-flight + session memo for contract reads. Every getVouch is a full simulation,
+ * and the dashboard mounts several readers that overlap — so dedupe by key.
+ */
+const readCache = new Map<string, Promise<unknown>>();
+
+/**
+ * Read-only call via simulation, memoized by (contract, method, args, source).
+ * Concurrent callers with the same key share one in-flight promise; a resolved value
+ * is reused for the session. A failed read is evicted so it can be retried.
+ */
+export async function readContractMemo<T>(
+  contractId: string,
+  method: string,
+  callArgs: xdr.ScVal[],
+  sourceAccount: string,
+): Promise<T> {
+  const key = cacheKey(contractId, method, callArgs, sourceAccount);
+  const cached = readCache.get(key) as Promise<T> | undefined;
+  if (cached) return cached;
+  const pending = readContract<T>(contractId, method, callArgs, sourceAccount).catch((e) => {
+    readCache.delete(key);
+    throw e;
+  });
+  readCache.set(key, pending);
+  return pending;
+}
+
+/** Memoized `invokeAndWait` for claimed vouches (they never change again). */
+export async function readContractMemoPublic<T>(
+  contractId: string,
+  method: string,
+  callArgs: xdr.ScVal[],
+): Promise<T> {
+  const key = cacheKey(contractId, method, callArgs, '');
+  const cached = readCache.get(key) as Promise<T> | undefined;
+  if (cached) return cached;
+  const pending = readPublic<T>(contractId, method, callArgs).catch((e) => {
+    readCache.delete(key);
+    throw e;
+  });
+  readCache.set(key, pending);
+  return pending;
+}
+
+function cacheKey(
+  contractId: string,
+  method: string,
+  callArgs: xdr.ScVal[],
+  sourceAccount: string,
+): string {
+  return [contractId, method, sourceAccount, ...callArgs.map((a) => a.toXDR('base64'))].join('|');
 }
