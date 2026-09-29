@@ -1,7 +1,7 @@
 /**
  * Activity feed — recent `vouch:claimed` edges and `tipped` transfers from RPC (the
- * sky is moving): "@x lit a star for @y" / "@x tipped @y 2 USDC". Social proof of life on
- * the dashboard, even when you're idle. RPC-direct (durable indexer deferred); merged by
+ * sky is moving): "@x lit a star for @y" / "@x tipped @y 2 USDC". Social proof of life on the
+ * dashboard, even when you're idle. RPC-direct (durable indexer deferred); merged by
  * ledger, newest-first, capped.
  */
 import { EVENTS } from '@alvinmunk/shared';

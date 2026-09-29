@@ -4,7 +4,14 @@
  * gets slashed if nobody claims within the window — re-share the link). The claimed ones
  * also surface the voucher bonus still waiting on each claimer (`getOwedBonuses`).
  */
-import { claimLink, getPending, getVouch, VOUCH_TTL_SECS, type ClaimCode } from './reputation';
+import {
+  claimLink,
+  getPending,
+  getVouch,
+  getVouchesBatch,
+  VOUCH_TTL_SECS,
+  type ClaimCode,
+} from './reputation';
 import { reverseHandle } from './registry';
 import { subscribeToPush } from './push';
 import { readJSON, writeJSON } from './storage';
@@ -42,14 +49,12 @@ export async function getPendingVouchIds(): Promise<number[]> {
   const mine = getMyVouches();
   if (mine.length === 0) return [];
   const now = Math.floor(Date.now() / 1000);
-  const ids = await Promise.all(
-    mine.map(async (m) => {
-      const v = await getVouch(m.id).catch(() => null);
-      if (!v || v.claimed || v.slashed) return null;
-      if (now >= v.created + VOUCH_TTL_SECS) return null;
-      return m.id;
-    }),
-  );
+  const chain = await getVouchesBatch(mine.map((m) => m.id));
+  const ids = chain.map((v, i) => {
+    if (!v || v.claimed || v.slashed) return null;
+    if (now >= v.created + VOUCH_TTL_SECS) return null;
+    return mine[i].id;
+  });
   return ids.filter((id): id is number => id !== null);
 }
 
@@ -68,19 +73,17 @@ export async function getPendingVouches(origin: string): Promise<PendingVouch[]>
   const mine = getMyVouches();
   const now = Math.floor(Date.now() / 1000);
   const out: PendingVouch[] = [];
-  await Promise.all(
-    mine.map(async (m) => {
-      const v = await getVouch(m.id).catch(() => null);
-      if (!v || v.claimed || v.slashed) return;
-      const deadline = v.created + VOUCH_TTL_SECS;
-      if (now >= deadline) return; // window closed — stake already slashable
-      out.push({
-        ...m,
-        claimUrl: claimLink(origin, m.id, claimCodeOf(m)),
-        daysLeft: Math.max(0, Math.ceil((deadline - now) / 86_400)),
-      });
-    }),
-  );
+  const chain = await getVouchesBatch(mine.map((m) => m.id));
+  chain.forEach((v, i) => {
+    if (!v || v.claimed || v.slashed) return;
+    const deadline = v.created + VOUCH_TTL_SECS;
+    if (now >= deadline) return; // window closed — stake already slashable
+    out.push({
+      ...mine[i],
+      claimUrl: claimLink(origin, mine[i].id, claimCodeOf(mine[i])),
+      daysLeft: Math.max(0, Math.ceil((deadline - now) / 86_400)),
+    });
+  });
   return out.sort((a, b) => a.daysLeft - b.daysLeft);
 }
 
@@ -104,7 +107,7 @@ export interface OwedBonus {
  */
 export async function getOwedBonuses(me: string): Promise<OwedBonus[]> {
   const mine = getMyVouches();
-  const chain = await Promise.all(mine.map((m) => getVouch(m.id).catch(() => null)));
+  const chain = await getVouchesBatch(mine.map((m) => m.id));
 
   // Unique claimers of MY claimed vouches (this browser may hold another wallet's too).
   const claimers = new Map<string, string>(); // claimer -> note of the newest vouch
@@ -149,8 +152,8 @@ export async function subscribeToVouchPush(walletAddress: string, vouchId: numbe
 
 /**
  * The one in-app notification that matters (Nicole/roundtable): your vouch to someone was
- * CLAIMED — their star ignited. Returns vouches claimed SINCE the last check (empty on the
- * first ever run, which just baselines so old claims don't flood). Marks them seen.
+ * CLAIMED — their star ignited. Returns vouches claimed SINCE the last check (empty on
+ * the first ever run, which just baselines so old claims don't flood). Marks them seen.
  *
  * NOTE: pollNewlyClaimed is in-session only. Web push (subscribeToVouchPush + service worker)
  * handles the bring-them-back case when the tab is closed.
@@ -162,14 +165,13 @@ export async function pollNewlyClaimed(): Promise<{ id: number; note: string }[]
   const seen = new Set(seenIds);
   const claimedNow: number[] = [];
   const fresh: { id: number; note: string }[] = [];
-  await Promise.all(
-    mine.slice(0, 25).map(async (m) => {
-      const v = await getVouch(m.id).catch(() => null);
-      if (!v?.claimed) return;
-      claimedNow.push(m.id);
-      if (baselined && !seen.has(m.id)) fresh.push({ id: m.id, note: m.note });
-    }),
-  );
+  const chain = await getVouchesBatch(mine.slice(0, 25).map((m) => m.id));
+  chain.forEach((v, i) => {
+    if (!v?.claimed) return;
+    const m = mine[i];
+    claimedNow.push(m.id);
+    if (baselined && !seen.has(m.id)) fresh.push({ id: m.id, note: m.note });
+  });
   // Persist the union so a claim is reported once; first run only baselines (no toasts).
   const next = Array.from(new Set([...seenIds, ...claimedNow]));
   writeJSON(SEEN_CLAIMED_KEY, next);

@@ -26,7 +26,7 @@ vi.mock('./contracts', () => ({
   readPublic: readPublicMock,
   readContract: vi.fn(),
   invokeAndWait: vi.fn(),
-  args: { addr: (g: string) => g },
+  args: { addr: (g: string) => g, u64: (n: number) => n },
 }));
 vi.mock('./registry', () => ({ reverseHandle: async () => null }));
 vi.mock('./push', () => ({ subscribeToPush: vi.fn() }));
@@ -79,7 +79,7 @@ describe('a cold /app load', () => {
     getEventsMock.mockImplementation(async (req: { filters: { contractIds: string[] }[] }) => ({
       events: req.filters[0].contractIds[0] === 'CREP' ? TO_ME.map((id, i) => claimedEvent(id, FRIENDS[i])) : [],
     }));
-    readPublicMock.mockResolvedValue([]);
+    readPublicPublicImplementation();
     sdkGetVouchMock.mockImplementation(async (id: number) => {
       peak = Math.max(peak, ++active);
       await new Promise((r) => setTimeout(r, 1));
@@ -97,14 +97,14 @@ describe('a cold /app load', () => {
     const stars = await fetchVouchersOf(ME);
     await getPendingVouchIds();
 
-    expect(stars.map((s) => s.vouchId).sort()).toEqual(TO_ME);
+    expect(stars.map((s) => s.vouchId).sort()).toEqual(TO_MI);
 
     const windows = getEventsMock.mock.calls.map((c) => c[0].filters[0].contractIds[0]);
     expect(windows.sort()).toEqual(['CREP', 'CRWD']);
     expect(getLatestLedgerMock).toHaveBeenCalledTimes(2);
 
     const ids = sdkGetVouchMock.mock.calls.map((c) => c[0] as number);
-    expect(ids.sort((a, b) => a - b)).toEqual([...MINE, ...TO_ME]);
+    expect(ids.sort((a, b) => a - b)).toEqual([...MINE,...TO_ME]);
     expect(peak).toBeLessThanOrEqual(VOUCH_READ_CONCURRENCY);
   });
 });

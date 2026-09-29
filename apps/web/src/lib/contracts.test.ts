@@ -1,4 +1,5 @@
 // @vitest-environment node
+// @vitest-environment node
 import {
   Account,
   Address,
@@ -23,6 +24,7 @@ const { server } = vi.hoisted(() => ({
     getTransaction: vi.fn(),
     getLedgerEntries: vi.fn(),
     getLatestLedger: vi.fn(),
+    simulateTransaction: vi.fn(),
   },
 }));
 vi.mock('./stellar', () => ({
@@ -37,6 +39,8 @@ import {
   invokeAndWait,
   invokeAndWaitHash,
   invokeCosigned,
+  getVouch,
+  clearVouchCache,
   readInstanceValue,
   readLedgerData,
 } from './contracts';
@@ -49,6 +53,7 @@ const u32 = (n: number) => nativeToScVal(n, { type: 'u32' });
 describe('invokeAndWait / invokeAndWaitHash', () => {
   beforeEach(() => {
     Object.values(server).forEach((m) => m.mockReset());
+    clearVouchCache();
   });
 
   it('classic wallet: build → sign → send → poll; returns the value or the hash', async () => {
@@ -193,6 +198,7 @@ describe('invokeCosigned', () => {
 
   beforeEach(() => {
     Object.values(server).forEach((m) => m.mockReset());
+    clearVouchCache();
     server.getLatestLedger.mockResolvedValue({ sequence: 1_000 });
     server.getAccount.mockImplementation(async () => new Account(SOURCE, '1'));
     server.sendTransaction.mockResolvedValue({ status: 'PENDING', hash: 'tx-hash' });
@@ -284,6 +290,7 @@ describe('invokeCosigned', () => {
 describe('direct ledger reads', () => {
   beforeEach(() => {
     server.getLedgerEntries.mockReset();
+    clearVouchCache();
   });
 
   const contract = new Contract(CONTRACT).address().toScAddress();
@@ -341,5 +348,54 @@ describe('direct ledger reads', () => {
 
     server.getLedgerEntries.mockResolvedValue({ entries: [] });
     await expect(readInstanceValue(CONTRACT, enumKey('Admin'))).resolves.toBeNull();
+  });
+});
+
+describe('getVouch memoization', () => {
+  beforeEach(() => {
+    Object.values(server).forEach((m) => m.mockReset());
+    clearVouchCache();
+  });
+
+  const vouchVal = (id: number) => nativeToScVal({ id, status: 'Pending' });
+
+  it('dedupes concurrent callers into a single RPC request per id', async () => {
+    server.simulateTransaction.mockResolvedValue({
+      result: { retval: vouchVal(1) },
+    });
+    const [a, b, c] = await Promise.all([
+      getVouch(CONTRACT, 1),
+      getVouch(CONTRACT, 1),
+      getVouch(CONTRACT, 1),
+    ]);
+    expect(server.simulateTransaction).toHaveBeenCalledTimes(1);
+    expect(a).toEqual(b);
+    expect(b).toEqual(c);
+  });
+
+  it('serves a second call from the short-TTL cache without a new request', async () => {
+    server.simulateTransaction.mockResolvedValue({
+      result: { retval: vouchVal(2) },
+    });
+    await getVouch(CONTRACT, 2);
+    await getVouch(CONTRACT, 2);
+    expect(server.simulateTransaction).toHaveBeenCalledTimes(1);
+  });
+
+  it('reads distinct ids independently', async () => {
+    server.simulateTransaction.mockImplementation(async (_tx: unknown) => ({
+      result: { retval: vouchVal(3) },
+    }));
+    await Promise.all([getVouch(CONTRACT, 3), getVouch(CONTRACT, 4)]);
+    expect(server.simulateTransaction).toHaveBeenCalledTimes(2);
+  });
+
+  it('does not cache a failed read, so a retry re-issues the request', async () => {
+    server.simulateTransaction
+      .mockRejectedValueOnce(new Error('429'))
+      .mockResolvedValueOnce({ result: { retval: vouchVal(5) } });
+    await expect(getVouch(CONTRACT, 5)).rejects.toThrow('429');
+    await expect(getVouch(CONTRACT, 5)).resolves.toBeTruthy();
+    expect(server.simulateTransaction).toHaveBeenCalledTimes(2);
   });
 });
